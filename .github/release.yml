@@ -1,0 +1,301 @@
+name: Build and Release
+
+# on:
+#   push:
+#     tags:
+#       - 'v*'
+#   workflow_dispatch:
+#     inputs:
+#       version:
+#         description: 'Release version (e.g., v1.2.0)'
+#         required: true
+#         type: string
+
+env:
+  JAVA_VERSION: '11'
+  JAVA_DISTRIBUTION: 'temurin'
+
+jobs:
+  validate:
+    name: Validate Build Environment
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Determine version
+      id: version
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          VERSION="${{ github.event.inputs.version }}"
+        else
+          VERSION="${{ github.ref_name }}"
+        fi
+        
+        # Remove 'v' prefix if present
+        VERSION=${VERSION#v}
+        
+        # Check if this is a prerelease (contains alpha, beta, rc)
+        if [[ $VERSION =~ (alpha|beta|rc) ]]; then
+          IS_PRERELEASE=true
+        else
+          IS_PRERELEASE=false
+        fi
+        
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "is_prerelease=$IS_PRERELEASE" >> $GITHUB_OUTPUT
+        echo "Detected version: $VERSION (prerelease: $IS_PRERELEASE)"
+
+    - name: Validate version format
+      run: |
+        VERSION="${{ steps.version.outputs.version }}"
+        if ! [[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9-]+)?$ ]]; then
+          echo "Invalid version format: $VERSION"
+          echo "Expected format: X.Y.Z or X.Y.Z-suffix"
+          exit 1
+        fi
+
+  build:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    needs: validate
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up JDK ${{ env.JAVA_VERSION }}
+      uses: actions/setup-java@v4
+      with:
+        java-version: ${{ env.JAVA_VERSION }}
+        distribution: ${{ env.JAVA_DISTRIBUTION }}
+
+    - name: Cache Maven dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.m2/repository
+        key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+        restore-keys: |
+          ${{ runner.os }}-maven-
+
+    - name: Update version in pom.xml
+      run: |
+        VERSION="${{ needs.validate.outputs.version }}"
+        mvn versions:set -DnewVersion=$VERSION -DgenerateBackupPoms=false
+        echo "Updated version to: $VERSION"
+
+    - name: Run tests
+      run: mvn clean test
+
+    - name: Run security scan
+      run: mvn org.owasp:dependency-check-maven:check
+
+    - name: Build JAR with dependencies
+      run: mvn clean package -DskipTests
+
+    - name: Verify JAR structure
+      run: |
+        JAR_FILE=$(find target -name "*-with-dependencies.jar" | head -1)
+        if [ ! -f "$JAR_FILE" ]; then
+          echo "JAR file not found!"
+          exit 1
+        fi
+        
+        echo "Verifying JAR structure..."
+        jar tf "$JAR_FILE" | grep -E "(META-INF/MANIFEST.MF|META-INF/services/java.sql.Driver)" || {
+          echo "Required files missing in JAR"
+          exit 1
+        }
+        
+        echo "JAR file: $JAR_FILE"
+        ls -lh "$JAR_FILE"
+
+    - name: Generate checksums
+      run: |
+        cd target
+        for file in *.jar; do
+          if [ -f "$file" ]; then
+            sha256sum "$file" > "${file}.sha256"
+            md5sum "$file" > "${file}.md5"
+          fi
+        done
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: build-artifacts
+        path: |
+          target/*.jar
+          target/*.sha256
+          target/*.md5
+        retention-days: 30
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: validate
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up JDK ${{ env.JAVA_VERSION }}
+      uses: actions/setup-java@v4
+      with:
+        java-version: ${{ env.JAVA_VERSION }}
+        distribution: ${{ env.JAVA_DISTRIBUTION }}
+
+    - name: Cache Maven dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.m2/repository
+        key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+        restore-keys: |
+          ${{ runner.os }}-maven-
+
+    - name: Run OWASP Dependency Check
+      run: mvn org.owasp:dependency-check-maven:check
+
+    - name: Upload security report
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: security-report
+        path: target/dependency-check-report.html
+
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [validate, build, security-scan]
+    permissions:
+      contents: write
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download build artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: build-artifacts
+        path: ./artifacts
+
+    - name: Prepare release files
+      id: prepare
+      run: |
+        VERSION="${{ needs.validate.outputs.version }}"
+        
+        # Find the main JAR file
+        MAIN_JAR=$(find artifacts -name "*-with-dependencies.jar" | head -1)
+        if [ ! -f "$MAIN_JAR" ]; then
+          echo "Main JAR file not found!"
+          exit 1
+        fi
+        
+        # Create release directory
+        mkdir -p release
+        
+        # Copy and rename files with consistent naming
+        cp "$MAIN_JAR" "release/metabase-jdbc-driver-${VERSION}.jar"
+        cp "${MAIN_JAR}.sha256" "release/metabase-jdbc-driver-${VERSION}.jar.sha256"
+        cp "${MAIN_JAR}.md5" "release/metabase-jdbc-driver-${VERSION}.jar.md5"
+        
+        echo "main_jar=release/metabase-jdbc-driver-${VERSION}.jar" >> $GITHUB_OUTPUT
+        echo "Files prepared for release:"
+        ls -la release/
+
+    - name: Generate release notes
+      id: release_notes
+      run: |
+        VERSION="${{ needs.validate.outputs.version }}"
+        
+        cat > release_notes.md << EOF
+        # Metabase JDBC Driver v${VERSION}
+        
+        ## What's New
+        
+        This release includes the latest improvements and bug fixes for the Metabase JDBC Driver.
+        
+        ## Installation
+        
+        ### Download
+        Download the JAR file from the assets below and add it to your JDBC client:
+        - \`metabase-jdbc-driver-${VERSION}.jar\` - Main driver with all dependencies
+        
+        ### DBeaver Setup
+        1. Go to **Database** → **Driver Manager**
+        2. Click **New** to create a new driver
+        3. Set **Class Name**: \`com.davydmaker.metabase.jdbc.MetabaseDriver\`
+        4. Set **URL Template**: \`jdbc:metabase://{host}:{port}/{database}\`
+        5. Add the downloaded JAR file to **Libraries**
+        
+        ### Connection URL
+        \`\`\`
+        jdbc:metabase://your-metabase-host/database-name?user=username&password=password
+        \`\`\`
+        
+        ## Verification
+        
+        Verify the download integrity using the provided checksums:
+        - SHA256: \`sha256sum metabase-jdbc-driver-${VERSION}.jar\`
+        - MD5: \`md5sum metabase-jdbc-driver-${VERSION}.jar\`
+        
+        ## Requirements
+        
+        - Java 11 or higher
+        - Access to a Metabase instance
+        - Valid Metabase user credentials
+        
+        ## Support
+        
+        - [Documentation](https://github.com/davydmaker/metabase-jdbc-driver#readme)
+        - [Issues](https://github.com/davydmaker/metabase-jdbc-driver/issues)
+        - [Discussions](https://github.com/davydmaker/metabase-jdbc-driver/discussions)
+        EOF
+        
+        echo "Release notes generated"
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: v${{ needs.validate.outputs.version }}
+        name: Metabase JDBC Driver v${{ needs.validate.outputs.version }}
+        body_path: release_notes.md
+        prerelease: ${{ needs.validate.outputs.is_prerelease }}
+        draft: false
+        files: |
+          release/*
+        fail_on_unmatched_files: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Update latest release info
+      if: needs.validate.outputs.is_prerelease == 'false'
+      run: |
+        echo "This is a stable release, marked as latest"
+
+  notify:
+    name: Notify Release
+    runs-on: ubuntu-latest
+    needs: [validate, create-release]
+    if: always()
+    
+    steps:
+    - name: Release Success Notification
+      if: needs.create-release.result == 'success'
+      run: |
+        echo "✅ Release v${{ needs.validate.outputs.version }} created successfully!"
+        echo "🔗 https://github.com/${{ github.repository }}/releases/tag/v${{ needs.validate.outputs.version }}"
+
+    - name: Release Failure Notification
+      if: needs.create-release.result == 'failure'
+      run: |
+        echo "❌ Release v${{ needs.validate.outputs.version }} failed!"
+        echo "Please check the workflow logs for details."
+        exit 1 
