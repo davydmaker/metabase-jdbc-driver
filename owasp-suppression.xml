@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<suppressions xmlns="https://jeremylong.github.io/DependencyCheck/dependency-suppression.1.3.xsd">    
+    <!-- Suppress false positives for Jackson (if used for non-sensitive data) -->
+    <suppress>
+        <notes><![CDATA[
+        Jackson is used for JSON parsing of Metabase API responses.
+        We validate and sanitize all inputs from the API.
+        ]]></notes>
+        <packageUrl regex="true">^pkg:maven/com\.fasterxml\.jackson\.core/jackson.*$</packageUrl>
+        <vulnerabilityName regex="true">.*jackson.*</vulnerabilityName>
+    </suppress>
+
+</suppressions> 

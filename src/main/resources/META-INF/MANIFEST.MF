@@ -1,0 +1,10 @@
+Manifest-Version: 1.0
+Implementation-Title: Metabase JDBC Driver
+Implementation-Version: 1.2.1
+Implementation-Vendor: Davyd Maker
+Implementation-URL: https://github.com/davydmaker/metabase-jdbc-driver
+Main-Class: com.davydmaker.metabase.jdbc.MetabaseDriver
+Bundle-Name: Metabase JDBC Driver
+Bundle-Version: 1.2.1
+Bundle-Description: JDBC Driver for Metabase API access
+Application-Icon: META-INF/metabase-driver-icon.svg
